@@ -1,0 +1,26 @@
+resources:
+  cloud: runpod
+  accelerators: H100:1 # test run
+  # accelerators: H100:10 # validation run
+  image_id: docker:runpod/parameter-golf:latest
+  use_spot: true # i mean this is probably fine
+
+file_mounts:
+  # for wandb
+  ~/.netrc: ~/.netrc
+
+setup: |
+  cd /workspace
+  git clone https://github.com/alt-potato/parameter-golf.git
+  cd parameter-golf
+  # download cached FineWeb dataset (1024-token vocabulary)
+  python3 data/cached_challenge_fineweb.py --variant sp1024
+
+run: |
+  cd /workspace/parameter-golf
+  RUN_ID=test_sp1024
+  DATA_PATH=./data/datasets/fineweb10B_sp1024/
+  TOKENIZER_PATH=./data/tokenizers/fineweb_1024_bpe.model
+  VOCAB_SIZE=1024
+  # WARNING: modify nproc_per_node to match GPU count
+  torchrun --standalone --nproc_per_node=1 train_gpt.py
