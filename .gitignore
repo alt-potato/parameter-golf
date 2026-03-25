@@ -11,6 +11,5 @@ data/docs_selected.jsonl
 .venv-1
 logs/
 
-wandb/
-typings/
+output/
 CLAUDE.md
