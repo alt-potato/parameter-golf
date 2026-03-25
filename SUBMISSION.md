@@ -1,5 +1,7 @@
 # WIP
 
+insert summary here
+
 ## Results
 
 - val_bpb: TBD
@@ -23,5 +25,9 @@ WIP
 
 ```sh
 # parameters WIP
-torchrun --standalone --nproc_per_node=1 train_gpt.py
+torchrun --standalone --nproc_per_node=8 train_gpt.py
 ```
+
+## References
+
+WIP
