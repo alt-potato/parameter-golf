@@ -1,10 +1,12 @@
 # How 2 Run
 
+Note that SkyPilot is not supported on Windows! Use WSL if necessary.
+
 ## Setup
 
 ```sh
 # skypilot
-pip install -U "skypilot[runpod]"
+pip install -U "skypilot-nightly[runpod]"
 
 # wandb
 pip install wandb
