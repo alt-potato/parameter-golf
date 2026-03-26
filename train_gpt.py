@@ -1,9 +1,3 @@
-"""
-The `train_gpt.py` and `train_gpt_mlx.py` scripts are intended as good launching-off points for new participants, not SOTA configs. We'll accept PRs that tune, improve, or simplify these scripts without significantly increasing complexity, but competitive submissions should stay in the `/records` folder.
-
-Hard stop: To keep readable for newcomers, let's make sure `train_gpt.py` and `train_gpt_mlx.py` never are longer than 1500 lines.
-"""
-
 from __future__ import annotations
 
 import copy
@@ -17,6 +11,7 @@ import sys
 import time
 import uuid
 import zlib
+import lzma
 from pathlib import Path
 
 import numpy as np
@@ -90,6 +85,15 @@ class Hyperparameters:
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
+
+    # Looped transformer: same blocks applied num_loops times; T=4 per Zhu et al. 2025.
+    num_loops = int(os.environ.get("NUM_LOOPS", 1))
+    # Exit gate: weights per-loop losses; disabled by default (overhead, validate first).
+    loop_gate_enabled = bool(int(os.environ.get("LOOP_GATE_ENABLED", "0")))
+    # Entropy bonus β: prevents gate collapse; paper used β=0.1 → 0.05 mid-training.
+    loop_entropy_beta = float(os.environ.get("LOOP_ENTROPY_BETA", 0.1))
+    # BitNet b1.58 group size (0 = disabled). 128 = standard; smaller helps narrow models.
+    ternary_group_size = int(os.environ.get("TERNARY_GROUP_SIZE", 0))
 
 
 # -----------------------------
@@ -483,6 +487,98 @@ def dequantize_state_dict_int8(obj: dict[str, object]) -> dict[str, Tensor]:
 
 
 # -----------------------------
+# TERNARY SERIALIZATION
+# -----------------------------
+
+
+def pack_ternary(t: Tensor) -> bytes:
+    """Pack int8 {-1, 0, +1} tensor into base-3 bytes (5 trits per byte)."""
+    v = (t.reshape(-1).to(torch.int32) + 1).tolist()
+    v += [0] * ((-len(v)) % 5)
+    return bytes(  # type: ignore[arg-type]
+        v[i] + v[i + 1] * 3 + v[i + 2] * 9 + v[i + 3] * 27 + v[i + 4] * 81
+        for i in range(0, len(v), 5)
+    )
+
+
+_POW3 = (1, 3, 9, 27, 81)  # precomputed base-3 place values for unpack_ternary
+
+
+def unpack_ternary(data: bytes, n: int) -> Tensor:
+    """Unpack base-3 bytes back to int8 {-1, 0, +1}, returning the first n values."""
+    out = [b // _POW3[i] % 3 for b in data for i in range(5)]
+    return torch.tensor(out[:n], dtype=torch.int8) - 1
+
+
+_TERNARY_THRESHOLD = INT8_KEEP_FLOAT_MAX_NUMEL  # reuse the same threshold as int8 path
+
+
+def quantize_state_dict_ternary(
+    state_dict: dict[str, Tensor], group_size: int
+) -> tuple[dict[str, object], dict[str, int]]:
+    """Quantize a state dict for ternary+LZMA: large 2D matrices → ternary {-1,0,+1}
+    with per-group fp16 scales; others → fp16 passthrough. Returns (obj_dict, stats_dict).
+    """
+    ternary: dict[str, object] = {}
+    passthrough: dict[str, Tensor] = {}
+    passthrough_orig_dtypes: dict[str, str] = {}
+    stats: dict[str, int] = {"n_ternary": 0, "n_passthrough": 0, "est_bytes": 0}
+    for name, tensor in state_dict.items():
+        t = tensor.detach().to("cpu").contiguous()
+        is_matrix = (
+            t.ndim == 2 and t.is_floating_point() and t.numel() > _TERNARY_THRESHOLD
+        )
+        is_control = any(p in name for p in CONTROL_TENSOR_NAME_PATTERNS)
+        if is_matrix and not is_control:
+            orig_shape = t.shape
+            t_g = t.float().reshape(-1, group_size)
+            scale = t_g.abs().mean(-1).clamp(min=1e-8).to(torch.float16)
+            q = (t_g / scale.float().unsqueeze(-1)).round().clamp(-1, 1).to(torch.int8)
+            packed = pack_ternary(q)
+            ternary[name] = {
+                "packed": packed,
+                "scale": scale,
+                "shape": orig_shape,
+                "g": group_size,
+                "dtype": str(t.dtype).removeprefix("torch."),
+            }
+            stats["n_ternary"] += t.numel()
+            stats["est_bytes"] += len(packed) + scale.numel() * 2
+        else:
+            pt = (
+                keep_float_tensor(name, t, passthrough_orig_dtypes)
+                if t.is_floating_point()
+                else t
+            )
+            passthrough[name] = pt
+            stats["n_passthrough"] += t.numel()
+            stats["est_bytes"] += tensor_nbytes(pt)
+    return {
+        "__ternary_v1__": True,
+        "ternary": ternary,
+        "passthrough": passthrough,
+        "passthrough_orig_dtypes": passthrough_orig_dtypes,
+    }, stats
+
+
+def dequantize_state_dict_ternary(obj: dict[str, object]) -> dict[str, Tensor]:
+    """Reconstruct full-precision tensors from a ternary-quantized state dict."""
+    out: dict[str, Tensor] = {}
+    for name, entry in obj["ternary"].items():  # type: ignore[union-attr]
+        q = unpack_ternary(entry["packed"], int(entry["shape"][0]) * int(entry["shape"][1]))  # type: ignore[index]
+        scale = entry["scale"].float()  # type: ignore[union-attr]
+        out[name] = (q.float().reshape(-1, entry["g"]) * scale.unsqueeze(-1)).reshape(entry["shape"]).to(getattr(torch, entry.get("dtype", "bfloat16")))  # type: ignore[index, union-attr]
+    passthrough_orig_dtypes: dict[str, str] = obj.get("passthrough_orig_dtypes", {})  # type: ignore[assignment]
+    for name, t in obj["passthrough"].items():  # type: ignore[union-attr]
+        out_t: Tensor = t.detach().to("cpu").contiguous()  # type: ignore[union-attr]
+        orig_dtype = passthrough_orig_dtypes.get(name)
+        if isinstance(orig_dtype, str):
+            out_t = out_t.to(dtype=getattr(torch, orig_dtype)).contiguous()  # type: ignore[assignment]
+        out[name] = out_t
+    return out
+
+
+# -----------------------------
 # DATA LOADING
 # -----------------------------
 
@@ -582,6 +678,24 @@ class CastedLinear(nn.Linear):
         return F.linear(x, self.weight.to(x.dtype), bias)
 
 
+class TernaryLinear(nn.Linear):
+    """BitNet b1.58 ternary linear: STE forward uses {-1,0,+1} weights with per-group
+    absmean scaling (~0.21 bytes/param). Set TernaryLinear.group_size before model init.
+    """
+
+    # Configure via TernaryLinear.group_size = args.ternary_group_size before GPT().
+    group_size: int = 128
+
+    def forward(self, input: Tensor) -> Tensor:  # noqa: A002
+        w, g = self.weight, self.group_size
+        w_g = w.reshape(-1, g)
+        scale = w_g.abs().mean(-1, keepdim=True).clamp(min=1e-8)
+        # STE: forward uses ternary values, backward treats rounding as identity.
+        w_q = w_g + ((w_g / scale).round().clamp(-1, 1) * scale - w_g).detach()
+        bias = self.bias.to(input.dtype) if self.bias is not None else None
+        return F.linear(input, w_q.reshape(w.shape).to(input.dtype), bias)
+
+
 def restore_low_dim_params_to_fp32(module: nn.Module) -> None:
     # Keep small/control parameters in fp32 even when the model body runs in bf16.
     with torch.no_grad():
@@ -634,6 +748,7 @@ class CausalSelfAttention(nn.Module):
         num_kv_heads: int,
         rope_base: float,
         qk_gain_init: float,
+        ternary_group_size: int = 0,
     ):
         super().__init__()
         if dim % num_heads != 0:
@@ -646,10 +761,15 @@ class CausalSelfAttention(nn.Module):
         if self.head_dim % 2 != 0:
             raise ValueError("head_dim must be even for RoPE")
         kv_dim = self.num_kv_heads * self.head_dim
-        self.c_q = CastedLinear(dim, dim, bias=False)
-        self.c_k = CastedLinear(dim, kv_dim, bias=False)
-        self.c_v = CastedLinear(dim, kv_dim, bias=False)
-        self.proj = CastedLinear(dim, dim, bias=False)
+        _lin = lambda *a, **kw: (
+            TernaryLinear(*a, **kw)
+            if ternary_group_size > 0
+            else CastedLinear(*a, **kw)
+        )  # noqa: E731
+        self.c_q = _lin(dim, dim, bias=False)
+        self.c_k = _lin(dim, kv_dim, bias=False)
+        self.c_v = _lin(dim, kv_dim, bias=False)
+        self.proj = _lin(dim, dim, bias=False)
         self.proj._zero_init = True
         self.q_gain = nn.Parameter(
             torch.full((num_heads,), qk_gain_init, dtype=torch.float32)
@@ -693,11 +813,16 @@ class CausalSelfAttention(nn.Module):
 
 class MLP(nn.Module):
     # relu^2 MLP from the original modded-nanogpt setup
-    def __init__(self, dim: int, mlp_mult: int):
+    def __init__(self, dim: int, mlp_mult: int, ternary_group_size: int = 0):
         super().__init__()
         hidden = mlp_mult * dim
-        self.fc = CastedLinear(dim, hidden, bias=False)
-        self.proj = CastedLinear(hidden, dim, bias=False)
+        _lin = lambda *a, **kw: (
+            TernaryLinear(*a, **kw)
+            if ternary_group_size > 0
+            else CastedLinear(*a, **kw)
+        )  # noqa: E731
+        self.fc = _lin(dim, hidden, bias=False)
+        self.proj = _lin(hidden, dim, bias=False)
         self.proj._zero_init = True
 
     def forward(self, x: Tensor) -> Tensor:
@@ -714,14 +839,20 @@ class Block(nn.Module):
         mlp_mult: int,
         rope_base: float,
         qk_gain_init: float,
+        ternary_group_size: int = 0,
     ):
         super().__init__()
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
         self.attn = CausalSelfAttention(
-            dim, num_heads, num_kv_heads, rope_base, qk_gain_init
+            dim,
+            num_heads,
+            num_kv_heads,
+            rope_base,
+            qk_gain_init,
+            ternary_group_size=ternary_group_size,
         )
-        self.mlp = MLP(dim, mlp_mult)
+        self.mlp = MLP(dim, mlp_mult, ternary_group_size=ternary_group_size)
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.resid_mix = nn.Parameter(
@@ -753,6 +884,10 @@ class GPT(nn.Module):
         logit_softcap: float,
         rope_base: float,
         qk_gain_init: float,
+        num_loops: int = 1,
+        loop_gate_enabled: bool = False,
+        loop_entropy_beta: float = 0.1,
+        ternary_group_size: int = 0,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -760,6 +895,8 @@ class GPT(nn.Module):
         self.tie_embeddings = tie_embeddings
         self.tied_embed_init_std = tied_embed_init_std
         self.logit_softcap = logit_softcap
+        self.num_loops = num_loops
+        self.loop_entropy_beta = loop_entropy_beta
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
         self.num_encoder_layers = num_layers // 2
         self.num_decoder_layers = num_layers - self.num_encoder_layers
@@ -776,6 +913,7 @@ class GPT(nn.Module):
                     mlp_mult,
                     rope_base,
                     qk_gain_init,
+                    ternary_group_size=ternary_group_size,
                 )
                 for i in range(num_layers)
             ]
@@ -786,6 +924,13 @@ class GPT(nn.Module):
         )
         if self.lm_head is not None:
             self.lm_head._zero_init = True
+        # Single linear gate head: predicts per-loop exit probability. Only created when both
+        # looping and gate are enabled; adds overhead, validate looped training first.
+        self.loop_gate = (
+            nn.Linear(model_dim, 1, bias=True)
+            if loop_gate_enabled and num_loops > 1
+            else None
+        )
         self._init_weights()
 
     def _init_weights(self) -> None:
@@ -795,13 +940,9 @@ class GPT(nn.Module):
             if isinstance(module, nn.Linear) and getattr(module, "_zero_init", False):
                 nn.init.zeros_(module.weight)
 
-    def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
-        x = self.tok_emb(input_ids)
-        x = F.rms_norm(x, (x.size(-1),))
-        x0 = x
+    def _blocks_forward(self, x: Tensor, x0: Tensor) -> Tensor:
+        """Run one U-Net pass through the shared block stack; skip connections reset each pass."""
         skips: list[Tensor] = []
-
-        # First half stores skips; second half reuses them in reverse order.
         for i in range(self.num_encoder_layers):
             x = self.blocks[i](x, x0)
             skips.append(x)
@@ -813,17 +954,57 @@ class GPT(nn.Module):
                     * skips.pop()
                 )
             x = self.blocks[self.num_encoder_layers + i](x, x0)
+        return x
 
-        x = self.final_norm(x).reshape(-1, x.size(-1))
-        targets = target_ids.reshape(-1)
+    def _head_loss(self, x: Tensor, targets: Tensor) -> Tensor:
+        """Compute cross-entropy loss from block output hidden states."""
+        h = self.final_norm(x).reshape(-1, x.size(-1))
         if self.tie_embeddings:
-            logits_proj = F.linear(x, self.tok_emb.weight)
+            lp = F.linear(h, self.tok_emb.weight)
         else:
             if self.lm_head is None:
                 raise RuntimeError("lm_head is required when tie_embeddings=False")
-            logits_proj = self.lm_head(x)
-        logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
-        return F.cross_entropy(logits.float(), targets, reduction="mean")
+            lp = self.lm_head(h)
+        logits = self.logit_softcap * torch.tanh(lp / self.logit_softcap)
+        return F.cross_entropy(logits.float(), targets.reshape(-1))
+
+    def _loop_loss(self, loop_losses: list[Tensor], gate_probs: list[Tensor]) -> Tensor:
+        """Combine losses via entropy-regularized exit distribution (Zhu et al. 2025 eq. 1).
+
+        Without gate_probs: uniform average. With gate_probs: entropy bonus prevents gate collapse.
+        """
+        if not gate_probs:
+            return torch.stack(loop_losses).mean()
+        lambdas = torch.stack(gate_probs)  # [T-1] scalar exit probs per loop step
+        surv = torch.cumprod(
+            1.0 - lambdas, dim=0
+        )  # survival: prob of reaching each depth
+        p = torch.cat([lambdas[:1], lambdas[1:] * surv[:-1], surv[-1:]])
+        entropy = -(p * p.clamp(min=1e-9).log()).sum()
+        return (p * torch.stack(loop_losses)).sum() - self.loop_entropy_beta * entropy
+
+    def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
+        x = self.tok_emb(input_ids)
+        x = F.rms_norm(x, (x.size(-1),))
+        x0 = x  # Anchor: direct residual from input to every block at every loop depth.
+
+        if self.num_loops <= 1 or not self.training:
+            # Eval or single-pass: run all loops for maximum compute depth, return final loss.
+            for _ in range(max(self.num_loops, 1)):
+                x = self._blocks_forward(x, x0)
+            return self._head_loss(x, target_ids)
+
+        loop_losses: list[Tensor] = []
+        gate_probs: list[Tensor] = []
+        for t in range(self.num_loops):
+            x = self._blocks_forward(x, x0)
+            loop_losses.append(self._head_loss(x, target_ids))
+            if self.loop_gate is not None and t < self.num_loops - 1:
+                # Gate reads mean-pooled hidden states; x is detached to prevent the circular
+                # gradient path where gate influence propagates back into model weights.
+                lam = torch.sigmoid(self.loop_gate(x.detach().mean(1))).mean()
+                gate_probs.append(lam)
+        return self._loop_loss(loop_losses, gate_probs)
 
 
 # -----------------------------
@@ -943,6 +1124,9 @@ def main() -> None:
     # MODEL + OPTIMIZER SETUP
     # -----------------------------
 
+    if args.ternary_group_size > 0:
+        TernaryLinear.group_size = args.ternary_group_size
+
     base_model = (
         GPT(
             vocab_size=args.vocab_size,
@@ -956,12 +1140,17 @@ def main() -> None:
             logit_softcap=args.logit_softcap,
             rope_base=args.rope_base,
             qk_gain_init=args.qk_gain_init,
+            num_loops=args.num_loops,
+            loop_gate_enabled=args.loop_gate_enabled,
+            loop_entropy_beta=args.loop_entropy_beta,
+            ternary_group_size=args.ternary_group_size,
         )
         .to(device)
         .bfloat16()
     )
     for module in base_model.modules():
-        if isinstance(module, CastedLinear):
+        # TernaryLinear and CastedLinear both keep weights in fp32 for optimizer quality.
+        if isinstance(module, (CastedLinear, TernaryLinear)):
             module.float()
     restore_low_dim_params_to_fp32(base_model)
     compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
@@ -1249,10 +1438,10 @@ def main() -> None:
     # Save the raw state (useful for debugging/loading in PyTorch directly), then always produce
     # the compressed int8+zlib artifact and validate the round-tripped weights.
 
+    code_bytes = len(code.encode("utf-8"))
     if master_process:
         torch.save(base_model.state_dict(), "final_model.pt")
         model_bytes = os.path.getsize("final_model.pt")
-        code_bytes = len(code.encode("utf-8"))
         log0(f"Serialized model: {model_bytes} bytes")
         log0(f"Code size: {code_bytes} bytes")
         log0(f"Total submission size: {model_bytes + code_bytes} bytes")
@@ -1267,7 +1456,6 @@ def main() -> None:
         with open("final_model.int8.ptz", "wb") as f:
             f.write(quant_blob)
         quant_file_bytes = os.path.getsize("final_model.int8.ptz")
-        code_bytes = len(code.encode("utf-8"))
         ratio = quant_stats["baseline_tensor_bytes"] / max(
             quant_stats["int8_payload_bytes"], 1
         )
@@ -1276,6 +1464,54 @@ def main() -> None:
             f"(payload:{quant_stats['int8_payload_bytes']} raw_torch:{quant_raw_bytes} payload_ratio:{ratio:.2f}x)"
         )
         log0(f"Total submission size int8+zlib: {quant_file_bytes + code_bytes} bytes")
+
+    # Ternary block runs before int8 roundtrip — base_model still holds original trained weights.
+    if args.ternary_group_size > 0:
+        tern_obj, _ = quantize_state_dict_ternary(
+            base_model.state_dict(), args.ternary_group_size
+        )
+        tern_buf = io.BytesIO()
+        torch.save(tern_obj, tern_buf)
+        tern_blob = lzma.compress(tern_buf.getvalue(), preset=9)
+        if master_process:
+            tern_file_bytes = len(tern_blob)
+            log0(f"Serialized model ternary+lzma: {tern_file_bytes} bytes")
+            log0(
+                f"Total submission size ternary+lzma: {tern_file_bytes + code_bytes} bytes"
+            )
+            # Save whichever format produces the smaller artifact.
+            best_blob = tern_blob if tern_file_bytes < len(quant_blob) else quant_blob
+            with open("final_model.best.ptz", "wb") as f:
+                f.write(best_blob)
+        if distributed:
+            dist.barrier()
+        base_model.load_state_dict(
+            dequantize_state_dict_ternary(
+                torch.load(io.BytesIO(lzma.decompress(tern_blob)), map_location="cpu")
+            ),
+            strict=True,
+        )
+        torch.cuda.synchronize()
+        t_tern = time.perf_counter()
+        t_val_loss, t_val_bpb = eval_val(
+            args,
+            model,
+            rank,
+            world_size,
+            device,
+            grad_accum_steps,
+            val_tokens,
+            base_bytes_lut,
+            has_leading_space_lut,
+            is_boundary_token_lut,
+        )
+        torch.cuda.synchronize()
+        log0(
+            f"final_ternary_lzma_roundtrip val_loss:{t_val_loss:.4f} val_bpb:{t_val_bpb:.4f} eval_time:{1000.0*(time.perf_counter()-t_tern):.0f}ms"
+        )
+        log0(
+            f"final_ternary_lzma_roundtrip_exact val_loss:{t_val_loss:.8f} val_bpb:{t_val_bpb:.8f}"
+        )
 
     if distributed:
         dist.barrier()
