@@ -87,13 +87,13 @@ class Hyperparameters:
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
 
     # Looped transformer: same blocks applied num_loops times; T=4 per Zhu et al. 2025.
-    num_loops = int(os.environ.get("NUM_LOOPS", 1))
+    num_loops = int(os.environ.get("NUM_LOOPS", 2))
     # Exit gate: weights per-loop losses; disabled by default (overhead, validate first).
-    loop_gate_enabled = bool(int(os.environ.get("LOOP_GATE_ENABLED", "0")))
+    loop_gate_enabled = bool(int(os.environ.get("LOOP_GATE_ENABLED", 1)))
     # Entropy bonus β: prevents gate collapse; paper used β=0.1 → 0.05 mid-training.
     loop_entropy_beta = float(os.environ.get("LOOP_ENTROPY_BETA", 0.1))
     # BitNet b1.58 group size (0 = disabled). 128 = standard; smaller helps narrow models.
-    ternary_group_size = int(os.environ.get("TERNARY_GROUP_SIZE", 0))
+    ternary_group_size = int(os.environ.get("TERNARY_GROUP_SIZE", 128))
 
 
 # -----------------------------

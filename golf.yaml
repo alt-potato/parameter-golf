@@ -1,8 +1,8 @@
 resources:
   cloud: runpod
-  accelerators: A40:1 # smoke test
+  # accelerators: A40:1 # smoke test
   # accelerators: H100:1 # cheaper test run, but it's never available T-T
-  # accelerators: H100-SXM:1 # test run
+  accelerators: H100-SXM:1 # test run
   # accelerators: H100-SXM:8 # scoring run
   image_id: docker:runpod/parameter-golf:latest
   use_spot: false # don't seem to be a lot of spot instances tbh...
@@ -26,7 +26,4 @@ run: |
   mkdir -p /workspace/export
 
   RUN_ID=test_sp1024 \
-  DATA_PATH=./data/datasets/fineweb10B_sp1024/ \
-  TOKENIZER_PATH=./data/tokenizers/fineweb_1024_bpe.model \
-  VOCAB_SIZE=1024 \
   torchrun --standalone --nproc_per_node=1 train_gpt.py | tee /workspace/export/train.log
