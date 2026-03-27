@@ -10,10 +10,10 @@ resources:
 workdir: .
 
 setup: |
-  # workdir already synced, move it to /workspace
-  mkdir -p /workspace/parameter-golf/
-  cp -R ~/sky_workdir/* /workspace/parameter-golf/
-  cd /workspace/parameter-golf
+  # replace default dir with symlink to synced workdir (just in case)
+  mkdir -p /workspace
+  rm -rf /workspace/parameter-golf
+  ln -s ~/sky_workdir /workspace/parameter-golf
 
   # download cached FineWeb dataset (1024-token vocabulary)
   python3 data/cached_challenge_fineweb.py --variant sp1024
